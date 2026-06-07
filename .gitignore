@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.claude/
+*.csv
+!squad_sample_200.csv
+!squad_validation.csv
+.env
+.DS_Store
