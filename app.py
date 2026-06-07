@@ -376,9 +376,11 @@ with st.sidebar:
     api_key = st.text_input("API Key", type="password", placeholder="sk-...")
     base_url_val = None
     if provider == "OpenAI":
+        api_key     = st.text_input("API Key", type="password", placeholder="sk-...")
         model       = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"])
         lm_model_id = f"openai/{model}"
     elif provider == "Anthropic":
+        api_key = st.text_input("API Key", type="password", placeholder="sk-ant-...")
         model = st.selectbox("Model", [
             "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
             "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307",
@@ -404,9 +406,17 @@ with st.sidebar:
     ])
         lm_model_id = f"groq/{model}"
     elif provider == "Together AI":
+        api_key     = st.text_input("API Key", type="password", placeholder="...")
         model       = st.text_input("Model name", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo")
         lm_model_id = f"together_ai/{model}"
+    elif provider == "Ollama (local)":
+        api_key     = ""
+        model       = st.text_input("Model name", "gemma4:e4b",
+                                    help="Run `ollama list` in terminal to see available models.")
+        lm_model_id = f"ollama/{model}"
+        st.info("Make sure `ollama serve` is running in a terminal.")
     else:
+        api_key      = st.text_input("API Key", type="password", placeholder="sk-...")
         base_url_val = st.text_input("Base URL", "http://localhost:11434/v1")
         model        = st.text_input("Model name", "llama3")
         lm_model_id  = f"openai/{model}"
@@ -428,7 +438,7 @@ with st.sidebar:
     st.divider()
     st.caption("Steps:  1 Dataset  →  2 Variables  →  3 Optimization  →  4 Results")
 
-lm_ready = bool(api_key)
+lm_ready = bool(api_key) or provider == "Ollama (local)"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1180,8 +1190,9 @@ with tab3:
                 lm_kwargs: dict = dict(
                     temperature=float(temperature),
                     max_tokens=int(max_tokens),
-                    api_key=api_key,
                 )
+                if api_key:
+                    lm_kwargs["api_key"] = api_key
                 if base_url_val:
                     lm_kwargs["api_base"] = base_url_val
                 lm = dspy.LM(lm_model_id, **lm_kwargs)
