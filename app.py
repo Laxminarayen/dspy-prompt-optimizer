@@ -5,6 +5,75 @@ import json
 from io import StringIO
 from datetime import datetime, timezone
 import traceback
+from collections import defaultdict
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Model Pricing & Token Tracking
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Pricing in USD per 1M tokens (input, output)
+MODEL_PRICING = {
+    # OpenAI
+    "gpt-4o": (5.00, 15.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4-turbo": (10.00, 30.00),
+    "gpt-3.5-turbo": (0.50, 1.50),
+    # Anthropic
+    "claude-opus-4-8": (15.00, 75.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-3-5-sonnet-20241022": (3.00, 15.00),
+    "claude-3-haiku-20240307": (0.25, 1.25),
+    # Groq
+    "llama-3.1-8b-instant": (0.0, 0.0),  # Free tier
+    # Default fallback
+    "default": (1.00, 2.00),
+}
+
+def get_model_pricing(model_str: str) -> tuple[float, float]:
+    """Extract pricing (input_price, output_price) per 1M tokens."""
+    # Try exact match first
+    if model_str in MODEL_PRICING:
+        return MODEL_PRICING[model_str]
+    
+    # Try partial match (e.g., "gpt-4o-mini" from "openai/gpt-4o-mini")
+    for key, value in MODEL_PRICING.items():
+        if key in model_str.lower():
+            return value
+    
+    return MODEL_PRICING["default"]
+
+def calculate_cost(input_tokens: int, output_tokens: int, pricing: tuple[float, float]) -> float:
+    """Calculate cost in USD given token counts and pricing."""
+    input_price, output_price = pricing
+    cost = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+    return round(cost, 4)
+
+def get_token_usage() -> dict:
+    """Extract token usage from dspy.settings.litellm_usage_logs."""
+    usage_data = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "calls": 0,
+    }
+    
+    try:
+        # LiteLLM logs usage in dspy.settings.litellm_usage_logs
+        if hasattr(dspy.settings, "litellm_usage_logs"):
+            logs = dspy.settings.litellm_usage_logs
+            if logs and isinstance(logs, list):
+                for log in logs:
+                    if isinstance(log, dict):
+                        usage_data["input_tokens"] += log.get("prompt_tokens", 0)
+                        usage_data["output_tokens"] += log.get("completion_tokens", 0)
+                        usage_data["calls"] += 1
+                usage_data["total_tokens"] = usage_data["input_tokens"] + usage_data["output_tokens"]
+    except Exception:
+        pass
+    
+    return usage_data
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -24,6 +93,8 @@ def build_result_json(compiled, optimizer_name, sig_str, task_desc, params, metr
                 k: (int(v) if hasattr(v, "__index__") else v) for k, v in params.items()
             },
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "token_usage": {},  # Will be populated after run
+            "cost_usd": 0.0,    # Will be populated after run
         },
         "predictors": {},
     }
@@ -249,6 +320,8 @@ def record_run(opt_name, compiled, eval_score, trainset, devset,
         "compiled":    compiled,
         "devset":      devset,
         "timestamp":   datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "token_usage": {},  # Will be populated after run
+        "cost_usd":    0.0,  # Will be populated after run
     })
     st.session_state["compiled_program"] = compiled
     st.session_state["result_json"]      = rj
@@ -284,9 +357,9 @@ with st.sidebar:
 
     provider = st.selectbox(
         "Provider",
-        ["OpenAI", "Anthropic", "Together AI", "Ollama (local)", "Custom (OpenAI-compatible)"],
+        ["OpenAI", "Anthropic", "Gemini", "Mistral", "Groq", "Together AI", "Custom (OpenAI-compatible)"],
     )
-
+    api_key = st.text_input("API Key", type="password", placeholder="sk-...")
     base_url_val = None
     if provider == "OpenAI":
         api_key     = st.text_input("API Key", type="password", placeholder="sk-...")
@@ -299,6 +372,25 @@ with st.sidebar:
             "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307",
         ])
         lm_model_id = f"anthropic/{model}"
+    elif provider == "Gemini":
+        model = st.selectbox("Model", ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"])
+        lm_model_id = f"gemini/{model}"
+    elif provider == "Mistral":
+         model = st.selectbox("Model", [
+        "mistral-large-latest",
+        "mistral-medium",
+        "mistral-small",
+        "open-mixtral-8x7b"
+    ])
+         lm_model_id = f"mistral/{model}"
+    elif provider == "Groq":
+        model = st.selectbox("Model", [
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma-7b-it"
+    ])
+        lm_model_id = f"groq/{model}"
     elif provider == "Together AI":
         api_key     = st.text_input("API Key", type="password", placeholder="...")
         model       = st.text_input("Model name", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo")
@@ -318,6 +410,17 @@ with st.sidebar:
     temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.05)
     max_tokens  = st.number_input("Max Tokens", 64, 8192, 1000, step=64)
 
+    st.divider()
+    st.subheader("💰 Credit Tracker")
+    current_credits = st.number_input(
+        "Current credits ($)",
+        min_value=0.0,
+        value=0.0,
+        step=0.01,
+        format="%.2f",
+        help="Enter your current API credits to see projected spend before running.",
+    )
+    st.session_state["current_credits"] = current_credits
     st.divider()
     st.caption("Steps:  1 Dataset  →  2 Variables  →  3 Optimization  →  4 Results")
 
@@ -388,19 +491,185 @@ def _estimate_llm_calls(opt_name: str, n_train: int, n_val: int,
         return "unknown"
 
 
+def _estimate_call_count(opt_name: str, n_train: int, n_val: int, n_eval: int, params: dict) -> int:
+    """Return estimated LLM call count as integer (mirrors _estimate_llm_calls logic)."""
+    try:
+        if opt_name == "LabeledFewShot":
+            return n_eval
+        elif opt_name == "BootstrapFewShot":
+            boots = int(params.get("max_bootstrapped_demos", 4))
+            return n_train * boots + n_eval
+        elif opt_name == "BootstrapFewShotWithRandomSearch":
+            boots  = int(params.get("max_bootstrapped_demos", 4))
+            n_cand = int(params.get("num_candidate_programs", 10))
+            return n_train * boots + n_cand * n_val + n_eval
+        elif opt_name == "MIPROv2":
+            auto   = params.get("auto", "light")
+            trials = {"light": 7, "medium": 20, "heavy": 50}.get(auto, int(params.get("num_trials", 10)))
+            n_cand = int(params.get("num_candidates", 5))
+            return n_cand * n_train + trials * min(n_val, 35) + n_eval
+        elif opt_name == "COPRO":
+            depth   = int(params.get("depth", 3))
+            breadth = int(params.get("breadth", 10))
+            return depth * breadth * n_train + n_eval
+        elif opt_name == "BootstrapFewShotWithOptuna":
+            boots  = int(params.get("max_bootstrapped_demos", 4))
+            trials = int(params.get("num_candidate_programs", 16))
+            return n_train * boots + trials * n_val + n_eval
+        elif opt_name == "GEPA":
+            auto       = params.get("auto", "light")
+            full_evals = {"light": 10, "medium": 25, "heavy": 60}.get(auto, 15)
+            return full_evals * n_train + n_eval
+        else:
+            return n_train + n_eval
+    except Exception:
+        return 0
+
+
+# ── Model pricing ($ per million tokens) ─────────────────────────────────────
+MODEL_PRICING: dict = {
+    "openai/gpt-4o":                        {"input": 2.50,  "output": 10.00},
+    "openai/gpt-4o-mini":                   {"input": 0.15,  "output": 0.60},
+    "openai/gpt-4-turbo":                   {"input": 10.00, "output": 30.00},
+    "openai/gpt-3.5-turbo":                 {"input": 0.50,  "output": 1.50},
+    "anthropic/claude-opus-4-8":            {"input": 15.00, "output": 75.00},
+    "anthropic/claude-sonnet-4-6":          {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-haiku-4-5-20251001":  {"input": 0.80,  "output": 4.00},
+    "anthropic/claude-3-5-sonnet-20241022": {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-3-haiku-20240307":    {"input": 0.25,  "output": 1.25},
+}
+_AVG_INPUT_TOKENS  = 500
+_AVG_OUTPUT_TOKENS = 100
+
+
+def _estimate_cost(model_id: str, n_calls: int) -> float | None:
+    """Estimate dollar cost for n_calls given model pricing."""
+    pricing = MODEL_PRICING.get(model_id)
+    if not pricing:
+        return None
+    return round(
+        (_AVG_INPUT_TOKENS  / 1_000_000) * pricing["input"]  * n_calls +
+        (_AVG_OUTPUT_TOKENS / 1_000_000) * pricing["output"] * n_calls,
+        4,
+    )
+
+
+def _recommend_optimizer(n_train: int, budget: float | None, metric_type: str) -> tuple:
+    """Return (optimizer_name, reasoning) based on dataset size and budget."""
+    no_budget  = budget is not None and budget < 0.50
+    low_budget = budget is not None and budget < 2.00
+
+    if n_train < 20 or no_budget:
+        reason = (
+            f"Very small training set ({n_train} rows) — LabeledFewShot avoids all bootstrapping overhead."
+            if n_train < 20 else
+            f"Very low budget (${budget:.2f}) — LabeledFewShot uses only eval calls, zero training calls."
+        )
+        return "LabeledFewShot", reason
+
+    if n_train < 50 or low_budget:
+        reason = (
+            f"Small training set ({n_train} rows) — BootstrapFewShot balances quality and cost well."
+            if n_train < 50 else
+            f"Moderate budget (${budget:.2f}) — BootstrapFewShot gives strong results without expensive search."
+        )
+        return "BootstrapFewShot", reason
+
+    if n_train >= 100 and not low_budget:
+        return (
+            "MIPROv2",
+            f"Large dataset ({n_train} rows) with sufficient budget — MIPROv2 Bayesian search gives best results.",
+        )
+
+    return (
+        "BootstrapFewShotWithRandomSearch",
+        f"Medium dataset ({n_train} rows) — RandomSearch explores candidate programs efficiently.",
+    )
+
+
+def _generate_python_export(rj: dict) -> str:
+    """Generate a ready-to-use Python DSPy script from result JSON."""
+    sig          = rj["meta"]["signature"]
+    opt          = rj["meta"]["optimizer"]
+    state        = rj.get("raw_state", {})
+    input_fields = [f.strip() for f in sig.split("->")[0].strip().split(",")]
+    output_field = sig.split("->")[1].strip()
+    inputs_str   = ", ".join(f'"{f}": "your_{f}_here"' for f in input_fields)
+    lines = [
+        "import dspy",
+        "",
+        "# ── 1. Configure your LM ──────────────────────────────────────────",
+        "lm = dspy.LM('your-model-id', api_key='your-api-key')",
+        "dspy.configure(lm=lm)",
+        "",
+        f"# ── 2. Define the module  (optimized by {opt}) ────────────────────",
+        "class OptimizedModule(dspy.Module):",
+        "    def __init__(self):",
+        "        super().__init__()",
+        f"        self.predict = dspy.Predict('{sig}')",
+        "",
+        "    def forward(self, **kwargs):",
+        "        return self.predict(**kwargs)",
+        "",
+        "# ── 3. Load the optimized state ───────────────────────────────────",
+        "module = OptimizedModule()",
+        f"optimized_state = {json.dumps(state, indent=4, default=str)}",
+        "module.load_state(optimized_state)",
+        "",
+        "# ── 4. Run inference ──────────────────────────────────────────────",
+        f"inputs = {{{inputs_str}}}",
+        "result = module(**inputs)",
+        f"print(result.{output_field})",
+    ]
+    return "\n".join(lines)
+
+
+def _generate_prompt_string(rj: dict) -> str:
+    """Generate a human-readable prompt string from result JSON."""
+    parts = []
+    for pname, pdata in rj.get("predictors", {}).items():
+        instructions = pdata["signature"].get("instructions", "")
+        if instructions:
+            parts.append(f"=== Instructions ===\n{instructions}")
+        demos = pdata.get("few_shot_examples", [])
+        if demos:
+            parts.append(f"\n=== Few-Shot Examples ({len(demos)}) ===")
+            for i, demo in enumerate(demos, 1):
+                parts.append(f"\n--- Example {i} ---")
+                for k, v in demo.items():
+                    parts.append(f"{k}: {v}")
+    parts.append(f"\n=== Signature ===\n{rj['meta']['signature']}")
+    return "\n".join(parts) if parts else "No prompt data available."
+
+
 def _df_uploader(key_prefix: str, label: str, example_df=None, example_label="") -> pd.DataFrame | None:
     """Reusable dataset uploader widget. Returns a DataFrame or None."""
     method = st.radio(
         "Input method",
-        ["Upload CSV", "Paste CSV text"] + (["Use example dataset"] if example_df is not None else []),
+        ["Upload CSV / JSON / XLSX", "Paste CSV text"] + (["Use example dataset"] if example_df is not None else []),
         horizontal=True,
         key=f"{key_prefix}_method",
     )
     df_out = None
-    if method == "Upload CSV":
-        f = st.file_uploader(f"Upload {label} CSV", type="csv", key=f"{key_prefix}_upload")
+    if method == "Upload CSV / JSON / XLSX":
+        f = st.file_uploader(
+            f"Upload {label} dataset",
+            type=["csv", "json", "xlsx"],
+            key=f"{key_prefix}_upload",
+        )
         if f:
-            df_out = pd.read_csv(f)
+            name = getattr(f, "name", "").lower()
+            try:
+                if name.endswith(".csv"):
+                    df_out = pd.read_csv(f)
+                elif name.endswith(".json"):
+                    df_out = pd.read_json(f)
+                elif name.endswith(".xlsx"):
+                    df_out = pd.read_excel(f, engine="openpyxl")
+                else:
+                    st.error("Unsupported file type. Please upload CSV, JSON, or XLSX.")
+            except Exception as e:
+                st.error(f"Could not parse file: {e}")
     elif method == "Paste CSV text":
         raw = st.text_area("Paste CSV content", height=180,
                            placeholder="question,context,answer\n...",
@@ -695,6 +964,23 @@ with tab3:
     else:
         all_opt_names = list(OPTIMIZERS.keys())
 
+        # ── Auto Optimizer Recommender ────────────────────────────────────────
+        with st.expander("🤖 Auto Optimizer Recommender", expanded=False):
+            n_train_avail   = len(st.session_state["df"]) if st.session_state["df"] is not None else 0
+            budget_val      = st.session_state.get("current_credits", 0.0) or 0.0
+            metric_val      = st.session_state.get("metric_type") or ""
+            rec_opt, rec_reason = _recommend_optimizer(
+                n_train_avail,
+                budget_val if budget_val > 0 else None,
+                metric_val,
+            )
+            st.success(f"**Recommended optimizer:** {rec_opt}")
+            st.caption(rec_reason)
+            ra, rb, rc = st.columns(3)
+            ra.metric("Training rows", n_train_avail)
+            rb.metric("Budget", f"${budget_val:.2f}" if budget_val > 0 else "Not set")
+            rc.metric("Metric", metric_val or "Not set")
+
         # ── Mode selector ─────────────────────────────────────────────────────
         mode = st.radio(
             "Mode",
@@ -840,17 +1126,34 @@ with tab3:
 
         # ── Cost estimate ─────────────────────────────────────────────────────
         if optimizers_to_run:
-            st.subheader("Estimated LLM Calls")
+            st.subheader("Estimated LLM Calls & Cost")
+            credits_avail        = st.session_state.get("current_credits", 0.0) or 0.0
+            total_estimated_cost = 0.0
             est_rows = []
             for oname in optimizers_to_run:
-                p_est = params_per_optimizer.get(oname, {})
-                est   = _estimate_llm_calls(oname, int(max_train), int(max_train * 0.2),
-                                            int(max_eval), p_est)
-                est_rows.append({"Optimizer": oname, "Estimated calls": est})
+                p_est   = params_per_optimizer.get(oname, {})
+                n_val_e = int(max_train * 0.2)
+                est     = _estimate_llm_calls(oname, int(max_train), n_val_e, int(max_eval), p_est)
+                n_calls = _estimate_call_count(oname, int(max_train), n_val_e, int(max_eval), p_est)
+                cost    = _estimate_cost(lm_model_id, n_calls)
+                total_estimated_cost += cost if cost is not None else 0.0
+                row = {"Optimizer": oname, "Est. calls": est}
+                if cost is not None:
+                    row["Est. cost ($)"] = f"${cost:.4f}"
+                    if credits_avail > 0:
+                        row["Credits after ($)"] = f"${max(0.0, credits_avail - cost):.2f}"
+                est_rows.append(row)
             st.dataframe(pd.DataFrame(est_rows), use_container_width=True, hide_index=True)
+            if credits_avail > 0 and total_estimated_cost > 0:
+                remaining = credits_avail - total_estimated_cost
+                colour    = "green" if remaining >= 0 else "red"
+                st.markdown(
+                    f"**Total estimated cost:** ${total_estimated_cost:.4f} &nbsp;|&nbsp; "
+                    f"**Projected remaining:** :{colour}[${max(0.0, remaining):.2f}]"
+                )
             st.caption(
-                "Estimates are approximate. Actual calls depend on caching, retries, "
-                "and optimizer internals. Each call uses your API quota."
+                "Cost estimates assume ~500 input + ~100 output tokens per call. "
+                "Actual cost depends on data length, caching, and retries."
             )
 
         st.divider()
@@ -951,6 +1254,10 @@ with tab3:
                         prog.progress(15, text=f"[{run_idx+1}/{n_sel}] {opt_name} — compiling…")
                         opt_params = dict(params_per_optimizer[opt_name])
 
+                        # Reset token tracking before this optimizer run
+                        if hasattr(dspy.settings, "litellm_usage_logs"):
+                            dspy.settings.litellm_usage_logs = []
+
                         with dspy.context(lm=lm):
                             # valset is used by optimizers for candidate selection;
                             # evalset is the separate held-out set used only for scoring.
@@ -981,6 +1288,23 @@ with tab3:
                         rj["meta"]["n_demos"]       = n_demos
                         rj["meta"]["instr_changed"] = instr_changed
                         rj["meta"]["baseline_score"] = base_score
+                        
+                        # Capture token usage and calculate cost
+                        token_usage = get_token_usage()
+                        pricing = get_model_pricing(lm_model_id)
+                        cost = calculate_cost(
+                            token_usage["input_tokens"],
+                            token_usage["output_tokens"],
+                            pricing
+                        )
+                        
+                        # Store token usage and cost in both session state and result JSON
+                        rj["meta"]["token_usage"] = token_usage
+                        rj["meta"]["cost_usd"] = cost
+                        
+                        st.session_state["optimization_runs"][-1]["token_usage"] = token_usage
+                        st.session_state["optimization_runs"][-1]["cost_usd"] = cost
+                        
                         # update the stored copy
                         st.session_state["optimization_runs"][-1]["result_json"] = rj
                         st.session_state["optimization_runs"][-1]["n_demos"]     = n_demos
@@ -992,12 +1316,14 @@ with tab3:
                             else None
                         )
                         results_so_far.append({
-                            "optimizer": opt_name, "score": eval_score, "delta": delta
+                            "optimizer": opt_name, "score": eval_score, "delta": delta,
+                            "tokens": token_usage["total_tokens"], "cost": cost
                         })
                         delta_str = f"  Δ baseline: {delta:+.2f}" if delta is not None else ""
+                        cost_str = f"  Cost: ${cost:.4f}" if cost > 0 else ""
                         prog.progress(100, text=(
                             f"[{run_idx+1}/{n_sel}] {opt_name} — done  "
-                            f"score: {eval_score}{delta_str}"
+                            f"score: {eval_score}{delta_str}{cost_str}"
                         ))
 
                     except Exception:
@@ -1013,7 +1339,7 @@ with tab3:
                         return "±0" if d == 0 else f"{d:+.2f}"
 
                     summary = "  |  ".join(
-                        f"**{r['optimizer']}**: {r['score']} ({_fmt_delta(r['delta'])})"
+                        f"**{r['optimizer']}**: {r['score']} ({_fmt_delta(r['delta'])}) | {r['tokens']} tokens | ${r['cost']:.4f}"
                         for r in results_so_far
                     )
                     status_box.success(f"✅ Done — {summary} — see **Results** tab.")
@@ -1047,6 +1373,7 @@ with tab4:
 
         # Build comparison dataframe
         compare_rows = []
+        total_cost = 0.0
         for idx, r in enumerate(runs):
             score_val = r["score"]
             delta_val = (
@@ -1054,11 +1381,18 @@ with tab4:
                 if score_val is not None and baseline_score is not None
                 else None
             )
+            token_usage = r.get("token_usage", {})
+            cost = r.get("cost_usd", 0.0)
+            total_cost += cost
             compare_rows.append({
                 "Run #":           idx + 1,
                 "Optimizer":       r["optimizer"],
                 "Score":           score_val if score_val is not None else "—",
                 "Δ Baseline":      (f"{delta_val:+.2f}" if delta_val is not None else "—"),
+                "Input Tokens":    token_usage.get("input_tokens", 0),
+                "Output Tokens":   token_usage.get("output_tokens", 0),
+                "Total Tokens":    token_usage.get("total_tokens", 0),
+                "Cost (USD)":      f"${cost:.4f}" if cost > 0 else "$0.00",
                 "Demos added":     r.get("n_demos", "—"),
                 "Instr. changed":  ("Yes" if r.get("instr_changed") else "No"),
                 "Eval rows":       r["n_eval"],
@@ -1070,6 +1404,14 @@ with tab4:
         # Baseline row
         if baseline_score is not None:
             st.metric("Baseline (no optimization)", f"{baseline_score}", help="Unoptimized module score on the same eval set")
+
+        # Cost summary
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Total Cost (USD)", f"${total_cost:.4f}", help="Sum of all optimization runs")
+        with c2:
+            avg_cost = total_cost / len(runs) if runs else 0
+            st.metric("Average Cost per Run", f"${avg_cost:.4f}")
 
         # Highlight best and flag identical scores
         numeric_scores = [r["score"] for r in runs if r["score"] is not None]
@@ -1147,6 +1489,15 @@ with tab4:
         sc3.metric("Optimizer", run["optimizer"])
         sc4.metric("Metric",    run["metric"])
 
+        # Token usage and cost banner
+        token_usage = run.get("token_usage", {})
+        cost_usd = run.get("cost_usd", 0.0)
+        tc1, tc2, tc3, tc4 = st.columns(4)
+        tc1.metric("Input Tokens", f"{token_usage.get('input_tokens', 0):,}")
+        tc2.metric("Output Tokens", f"{token_usage.get('output_tokens', 0):,}")
+        tc3.metric("Total Tokens", f"{token_usage.get('total_tokens', 0):,}")
+        tc4.metric("Cost (USD)", f"${cost_usd:.4f}")
+
         # ── Per-predictor details ──────────────────────────────────────────
         st.subheader("Optimized Predictors")
         for pname, pdata in rj["predictors"].items():
@@ -1195,6 +1546,32 @@ with tab4:
             use_container_width=True,
         )
         st.json(rj, expanded=False)
+
+        # ── Export & Deploy ────────────────────────────────────────────────
+        st.subheader("📦 Export & Deploy")
+        exp_tab1, exp_tab2 = st.tabs(["🐍  Python DSPy Module", "📝  Raw Prompt String"])
+
+        with exp_tab1:
+            py_code = _generate_python_export(rj)
+            st.code(py_code, language="python")
+            st.download_button(
+                label="⬇️  Download .py file",
+                data=py_code,
+                file_name=f"run{selected_run_idx+1}_{safe_name}_module.py",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+        with exp_tab2:
+            prompt_str = _generate_prompt_string(rj)
+            st.text_area("Prompt string", value=prompt_str, height=300)
+            st.download_button(
+                label="⬇️  Download .txt file",
+                data=prompt_str,
+                file_name=f"run{selected_run_idx+1}_{safe_name}_prompt.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
         st.divider()
 
