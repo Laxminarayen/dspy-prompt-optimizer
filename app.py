@@ -357,7 +357,7 @@ with st.sidebar:
 
     provider = st.selectbox(
         "Provider",
-        ["OpenAI", "Anthropic", "Together AI", "Custom (OpenAI-compatible)"],
+        ["OpenAI", "Anthropic", "Gemini", "Mistral", "Groq", "Together AI", "Custom (OpenAI-compatible)"],
     )
     api_key = st.text_input("API Key", type="password", placeholder="sk-...")
 
@@ -371,6 +371,25 @@ with st.sidebar:
             "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307",
         ])
         lm_model_id = f"anthropic/{model}"
+    elif provider == "Gemini":
+        model = st.selectbox("Model", ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"])
+        lm_model_id = f"gemini/{model}"
+    elif provider == "Mistral":
+         model = st.selectbox("Model", [
+        "mistral-large-latest",
+        "mistral-medium",
+        "mistral-small",
+        "open-mixtral-8x7b"
+    ])
+         lm_model_id = f"mistral/{model}"
+    elif provider == "Groq":
+        model = st.selectbox("Model", [
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma-7b-it"
+    ])
+        lm_model_id = f"groq/{model}"
     elif provider == "Together AI":
         model       = st.text_input("Model name", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo")
         lm_model_id = f"together_ai/{model}"
