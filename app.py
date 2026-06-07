@@ -287,9 +287,6 @@ with st.sidebar:
         ["OpenAI", "Anthropic", "Together AI", "Custom (OpenAI-compatible)"],
     )
     api_key = st.text_input("API Key", type="password", placeholder="sk-...")
-    if provider == "Custom (OpenAI-compatible)":
-        st.caption("Leave blank for local Ollama or other self-hosted OpenAI-compatible endpoints.")
-
     base_url_val = None
     if provider == "OpenAI":
         model       = st.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"])
@@ -314,7 +311,7 @@ with st.sidebar:
     st.divider()
     st.caption("Steps:  1 Dataset  →  2 Variables  →  3 Optimization  →  4 Results")
 
-lm_ready = bool(api_key) or provider == "Custom (OpenAI-compatible)"
+lm_ready = bool(api_key)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
