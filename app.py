@@ -287,6 +287,8 @@ with st.sidebar:
         ["OpenAI", "Anthropic", "Together AI", "Custom (OpenAI-compatible)"],
     )
     api_key = st.text_input("API Key", type="password", placeholder="sk-...")
+    if provider == "Custom (OpenAI-compatible)":
+        st.caption("Leave blank for local Ollama or other self-hosted OpenAI-compatible endpoints.")
 
     base_url_val = None
     if provider == "OpenAI":
@@ -312,7 +314,7 @@ with st.sidebar:
     st.divider()
     st.caption("Steps:  1 Dataset  →  2 Variables  →  3 Optimization  →  4 Results")
 
-lm_ready = bool(api_key)
+lm_ready = bool(api_key) or provider == "Custom (OpenAI-compatible)"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,15 +385,30 @@ def _df_uploader(key_prefix: str, label: str, example_df=None, example_label="")
     """Reusable dataset uploader widget. Returns a DataFrame or None."""
     method = st.radio(
         "Input method",
-        ["Upload CSV", "Paste CSV text"] + (["Use example dataset"] if example_df is not None else []),
+        ["Upload CSV / JSON / XLSX", "Paste CSV text"] + (["Use example dataset"] if example_df is not None else []),
         horizontal=True,
         key=f"{key_prefix}_method",
     )
     df_out = None
-    if method == "Upload CSV":
-        f = st.file_uploader(f"Upload {label} CSV", type="csv", key=f"{key_prefix}_upload")
+    if method == "Upload CSV / JSON / XLSX":
+        f = st.file_uploader(
+            f"Upload {label} dataset",
+            type=["csv", "json", "xlsx"],
+            key=f"{key_prefix}_upload",
+        )
         if f:
-            df_out = pd.read_csv(f)
+            name = getattr(f, "name", "").lower()
+            try:
+                if name.endswith(".csv"):
+                    df_out = pd.read_csv(f)
+                elif name.endswith(".json"):
+                    df_out = pd.read_json(f)
+                elif name.endswith(".xlsx"):
+                    df_out = pd.read_excel(f, engine="openpyxl")
+                else:
+                    st.error("Unsupported file type. Please upload CSV, JSON, or XLSX.")
+            except Exception as e:
+                st.error(f"Could not parse file: {e}")
     elif method == "Paste CSV text":
         raw = st.text_area("Paste CSV content", height=180,
                            placeholder="question,context,answer\n...",

@@ -12,7 +12,7 @@ A Streamlit app that lets you upload any tabular dataset, define input features 
 
 | Tab | Purpose |
 |-----|---------|
-| **Dataset** | Upload a training CSV and an optional held-out test CSV. Six built-in topic examples let you try the app instantly. |
+| **Dataset** | Upload a training CSV, JSON, or XLSX dataset and an optional held-out test file. Six built-in topic examples let you try the app instantly. |
 | **Variables** | Pick input (X) columns, the target (Y) column, write a task description, and choose an evaluation metric. |
 | **Optimization** | Select one optimizer or compare all seven at once. Set dataset size guardrails, review LLM-call cost estimates, then click Run. |
 | **Results** | Baseline vs. optimized scores in a comparison table and bar chart. Per-run inspector with instructions, few-shot examples, and a JSON download. Live inference section to test the compiled program immediately. |
