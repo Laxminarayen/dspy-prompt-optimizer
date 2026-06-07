@@ -93,10 +93,24 @@ def create_metric_fn(metric_type, target_col):
             return str(obj._store[key])
         return ""
 
+    # if metric_type == "Exact Match (case-insensitive)":
+    #     def metric(example, prediction, trace=None):
+    #         return _get(example, target_col).lower().strip() == \
+    #                _get(prediction, target_col).lower().strip()
+
+    def normalize_text(value):
+        return (
+            str(value)
+            .strip()
+            .upper()
+            .replace(" ", "_")
+            .replace("CATEGORY:", "")
+        )
+
     if metric_type == "Exact Match (case-insensitive)":
         def metric(example, prediction, trace=None):
-            return _get(example, target_col).lower().strip() == \
-                   _get(prediction, target_col).lower().strip()
+            return normalize_text(_get(example, target_col)) == \
+                normalize_text(_get(prediction, target_col))
 
     elif metric_type == "Contains Answer":
         def metric(example, prediction, trace=None):
