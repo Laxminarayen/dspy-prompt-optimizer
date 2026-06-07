@@ -310,6 +310,17 @@ with st.sidebar:
     max_tokens  = st.number_input("Max Tokens", 64, 8192, 1000, step=64)
 
     st.divider()
+    st.subheader("💰 Credit Tracker")
+    current_credits = st.number_input(
+        "Current credits ($)",
+        min_value=0.0,
+        value=0.0,
+        step=0.01,
+        format="%.2f",
+        help="Enter your current API credits to see projected spend before running.",
+    )
+    st.session_state["current_credits"] = current_credits
+    st.divider()
     st.caption("Steps:  1 Dataset  →  2 Variables  →  3 Optimization  →  4 Results")
 
 lm_ready = bool(api_key)
@@ -377,6 +388,157 @@ def _estimate_llm_calls(opt_name: str, n_train: int, n_val: int,
         return f"~{total:,} calls ({label})"
     except Exception:
         return "unknown"
+
+
+def _estimate_call_count(opt_name: str, n_train: int, n_val: int, n_eval: int, params: dict) -> int:
+    """Return estimated LLM call count as integer (mirrors _estimate_llm_calls logic)."""
+    try:
+        if opt_name == "LabeledFewShot":
+            return n_eval
+        elif opt_name == "BootstrapFewShot":
+            boots = int(params.get("max_bootstrapped_demos", 4))
+            return n_train * boots + n_eval
+        elif opt_name == "BootstrapFewShotWithRandomSearch":
+            boots  = int(params.get("max_bootstrapped_demos", 4))
+            n_cand = int(params.get("num_candidate_programs", 10))
+            return n_train * boots + n_cand * n_val + n_eval
+        elif opt_name == "MIPROv2":
+            auto   = params.get("auto", "light")
+            trials = {"light": 7, "medium": 20, "heavy": 50}.get(auto, int(params.get("num_trials", 10)))
+            n_cand = int(params.get("num_candidates", 5))
+            return n_cand * n_train + trials * min(n_val, 35) + n_eval
+        elif opt_name == "COPRO":
+            depth   = int(params.get("depth", 3))
+            breadth = int(params.get("breadth", 10))
+            return depth * breadth * n_train + n_eval
+        elif opt_name == "BootstrapFewShotWithOptuna":
+            boots  = int(params.get("max_bootstrapped_demos", 4))
+            trials = int(params.get("num_candidate_programs", 16))
+            return n_train * boots + trials * n_val + n_eval
+        elif opt_name == "GEPA":
+            auto       = params.get("auto", "light")
+            full_evals = {"light": 10, "medium": 25, "heavy": 60}.get(auto, 15)
+            return full_evals * n_train + n_eval
+        else:
+            return n_train + n_eval
+    except Exception:
+        return 0
+
+
+# ── Model pricing ($ per million tokens) ─────────────────────────────────────
+MODEL_PRICING: dict = {
+    "openai/gpt-4o":                        {"input": 2.50,  "output": 10.00},
+    "openai/gpt-4o-mini":                   {"input": 0.15,  "output": 0.60},
+    "openai/gpt-4-turbo":                   {"input": 10.00, "output": 30.00},
+    "openai/gpt-3.5-turbo":                 {"input": 0.50,  "output": 1.50},
+    "anthropic/claude-opus-4-8":            {"input": 15.00, "output": 75.00},
+    "anthropic/claude-sonnet-4-6":          {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-haiku-4-5-20251001":  {"input": 0.80,  "output": 4.00},
+    "anthropic/claude-3-5-sonnet-20241022": {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-3-haiku-20240307":    {"input": 0.25,  "output": 1.25},
+}
+_AVG_INPUT_TOKENS  = 500
+_AVG_OUTPUT_TOKENS = 100
+
+
+def _estimate_cost(model_id: str, n_calls: int) -> float | None:
+    """Estimate dollar cost for n_calls given model pricing."""
+    pricing = MODEL_PRICING.get(model_id)
+    if not pricing:
+        return None
+    return round(
+        (_AVG_INPUT_TOKENS  / 1_000_000) * pricing["input"]  * n_calls +
+        (_AVG_OUTPUT_TOKENS / 1_000_000) * pricing["output"] * n_calls,
+        4,
+    )
+
+
+def _recommend_optimizer(n_train: int, budget: float | None, metric_type: str) -> tuple:
+    """Return (optimizer_name, reasoning) based on dataset size and budget."""
+    no_budget  = budget is not None and budget < 0.50
+    low_budget = budget is not None and budget < 2.00
+
+    if n_train < 20 or no_budget:
+        reason = (
+            f"Very small training set ({n_train} rows) — LabeledFewShot avoids all bootstrapping overhead."
+            if n_train < 20 else
+            f"Very low budget (${budget:.2f}) — LabeledFewShot uses only eval calls, zero training calls."
+        )
+        return "LabeledFewShot", reason
+
+    if n_train < 50 or low_budget:
+        reason = (
+            f"Small training set ({n_train} rows) — BootstrapFewShot balances quality and cost well."
+            if n_train < 50 else
+            f"Moderate budget (${budget:.2f}) — BootstrapFewShot gives strong results without expensive search."
+        )
+        return "BootstrapFewShot", reason
+
+    if n_train >= 100 and not low_budget:
+        return (
+            "MIPROv2",
+            f"Large dataset ({n_train} rows) with sufficient budget — MIPROv2 Bayesian search gives best results.",
+        )
+
+    return (
+        "BootstrapFewShotWithRandomSearch",
+        f"Medium dataset ({n_train} rows) — RandomSearch explores candidate programs efficiently.",
+    )
+
+
+def _generate_python_export(rj: dict) -> str:
+    """Generate a ready-to-use Python DSPy script from result JSON."""
+    sig          = rj["meta"]["signature"]
+    opt          = rj["meta"]["optimizer"]
+    state        = rj.get("raw_state", {})
+    input_fields = [f.strip() for f in sig.split("->")[0].strip().split(",")]
+    output_field = sig.split("->")[1].strip()
+    inputs_str   = ", ".join(f'"{f}": "your_{f}_here"' for f in input_fields)
+    lines = [
+        "import dspy",
+        "",
+        "# ── 1. Configure your LM ──────────────────────────────────────────",
+        "lm = dspy.LM('your-model-id', api_key='your-api-key')",
+        "dspy.configure(lm=lm)",
+        "",
+        f"# ── 2. Define the module  (optimized by {opt}) ────────────────────",
+        "class OptimizedModule(dspy.Module):",
+        "    def __init__(self):",
+        "        super().__init__()",
+        f"        self.predict = dspy.Predict('{sig}')",
+        "",
+        "    def forward(self, **kwargs):",
+        "        return self.predict(**kwargs)",
+        "",
+        "# ── 3. Load the optimized state ───────────────────────────────────",
+        "module = OptimizedModule()",
+        f"optimized_state = {json.dumps(state, indent=4, default=str)}",
+        "module.load_state(optimized_state)",
+        "",
+        "# ── 4. Run inference ──────────────────────────────────────────────",
+        f"inputs = {{{inputs_str}}}",
+        "result = module(**inputs)",
+        f"print(result.{output_field})",
+    ]
+    return "\n".join(lines)
+
+
+def _generate_prompt_string(rj: dict) -> str:
+    """Generate a human-readable prompt string from result JSON."""
+    parts = []
+    for pname, pdata in rj.get("predictors", {}).items():
+        instructions = pdata["signature"].get("instructions", "")
+        if instructions:
+            parts.append(f"=== Instructions ===\n{instructions}")
+        demos = pdata.get("few_shot_examples", [])
+        if demos:
+            parts.append(f"\n=== Few-Shot Examples ({len(demos)}) ===")
+            for i, demo in enumerate(demos, 1):
+                parts.append(f"\n--- Example {i} ---")
+                for k, v in demo.items():
+                    parts.append(f"{k}: {v}")
+    parts.append(f"\n=== Signature ===\n{rj['meta']['signature']}")
+    return "\n".join(parts) if parts else "No prompt data available."
 
 
 def _df_uploader(key_prefix: str, label: str, example_df=None, example_label="") -> pd.DataFrame | None:
@@ -686,6 +848,23 @@ with tab3:
     else:
         all_opt_names = list(OPTIMIZERS.keys())
 
+        # ── Auto Optimizer Recommender ────────────────────────────────────────
+        with st.expander("🤖 Auto Optimizer Recommender", expanded=False):
+            n_train_avail   = len(st.session_state["df"]) if st.session_state["df"] is not None else 0
+            budget_val      = st.session_state.get("current_credits", 0.0) or 0.0
+            metric_val      = st.session_state.get("metric_type") or ""
+            rec_opt, rec_reason = _recommend_optimizer(
+                n_train_avail,
+                budget_val if budget_val > 0 else None,
+                metric_val,
+            )
+            st.success(f"**Recommended optimizer:** {rec_opt}")
+            st.caption(rec_reason)
+            ra, rb, rc = st.columns(3)
+            ra.metric("Training rows", n_train_avail)
+            rb.metric("Budget", f"${budget_val:.2f}" if budget_val > 0 else "Not set")
+            rc.metric("Metric", metric_val or "Not set")
+
         # ── Mode selector ─────────────────────────────────────────────────────
         mode = st.radio(
             "Mode",
@@ -831,17 +1010,34 @@ with tab3:
 
         # ── Cost estimate ─────────────────────────────────────────────────────
         if optimizers_to_run:
-            st.subheader("Estimated LLM Calls")
+            st.subheader("Estimated LLM Calls & Cost")
+            credits_avail        = st.session_state.get("current_credits", 0.0) or 0.0
+            total_estimated_cost = 0.0
             est_rows = []
             for oname in optimizers_to_run:
-                p_est = params_per_optimizer.get(oname, {})
-                est   = _estimate_llm_calls(oname, int(max_train), int(max_train * 0.2),
-                                            int(max_eval), p_est)
-                est_rows.append({"Optimizer": oname, "Estimated calls": est})
+                p_est   = params_per_optimizer.get(oname, {})
+                n_val_e = int(max_train * 0.2)
+                est     = _estimate_llm_calls(oname, int(max_train), n_val_e, int(max_eval), p_est)
+                n_calls = _estimate_call_count(oname, int(max_train), n_val_e, int(max_eval), p_est)
+                cost    = _estimate_cost(lm_model_id, n_calls)
+                total_estimated_cost += cost if cost is not None else 0.0
+                row = {"Optimizer": oname, "Est. calls": est}
+                if cost is not None:
+                    row["Est. cost ($)"] = f"${cost:.4f}"
+                    if credits_avail > 0:
+                        row["Credits after ($)"] = f"${max(0.0, credits_avail - cost):.2f}"
+                est_rows.append(row)
             st.dataframe(pd.DataFrame(est_rows), use_container_width=True, hide_index=True)
+            if credits_avail > 0 and total_estimated_cost > 0:
+                remaining = credits_avail - total_estimated_cost
+                colour    = "green" if remaining >= 0 else "red"
+                st.markdown(
+                    f"**Total estimated cost:** ${total_estimated_cost:.4f} &nbsp;|&nbsp; "
+                    f"**Projected remaining:** :{colour}[${max(0.0, remaining):.2f}]"
+                )
             st.caption(
-                "Estimates are approximate. Actual calls depend on caching, retries, "
-                "and optimizer internals. Each call uses your API quota."
+                "Cost estimates assume ~500 input + ~100 output tokens per call. "
+                "Actual cost depends on data length, caching, and retries."
             )
 
         st.divider()
@@ -1185,6 +1381,32 @@ with tab4:
             use_container_width=True,
         )
         st.json(rj, expanded=False)
+
+        # ── Export & Deploy ────────────────────────────────────────────────
+        st.subheader("📦 Export & Deploy")
+        exp_tab1, exp_tab2 = st.tabs(["🐍  Python DSPy Module", "📝  Raw Prompt String"])
+
+        with exp_tab1:
+            py_code = _generate_python_export(rj)
+            st.code(py_code, language="python")
+            st.download_button(
+                label="⬇️  Download .py file",
+                data=py_code,
+                file_name=f"run{selected_run_idx+1}_{safe_name}_module.py",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+        with exp_tab2:
+            prompt_str = _generate_prompt_string(rj)
+            st.text_area("Prompt string", value=prompt_str, height=300)
+            st.download_button(
+                label="⬇️  Download .txt file",
+                data=prompt_str,
+                file_name=f"run{selected_run_idx+1}_{safe_name}_prompt.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
         st.divider()
 
