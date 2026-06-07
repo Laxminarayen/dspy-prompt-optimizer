@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
 import dspy
+from dspy.utils.usage_tracker import UsageTracker
 import json
 from io import StringIO
 from datetime import datetime, timezone
 import traceback
-from collections import defaultdict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -33,15 +33,12 @@ MODEL_PRICING = {
 
 def get_model_pricing(model_str: str) -> tuple[float, float]:
     """Extract pricing (input_price, output_price) per 1M tokens."""
-    # Try exact match first
     if model_str in MODEL_PRICING:
         return MODEL_PRICING[model_str]
-    
-    # Try partial match (e.g., "gpt-4o-mini" from "openai/gpt-4o-mini")
-    for key, value in MODEL_PRICING.items():
+    # Sort longest keys first so "gpt-4o-mini" matches before "gpt-4o"
+    for key in sorted((k for k in MODEL_PRICING if k != "default"), key=len, reverse=True):
         if key in model_str.lower():
-            return value
-    
+            return MODEL_PRICING[key]
     return MODEL_PRICING["default"]
 
 def calculate_cost(input_tokens: int, output_tokens: int, pricing: tuple[float, float]) -> float:
@@ -50,34 +47,38 @@ def calculate_cost(input_tokens: int, output_tokens: int, pricing: tuple[float, 
     cost = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
     return round(cost, 4)
 
-def get_token_usage() -> dict:
-    """Extract token usage from dspy.settings.litellm_usage_logs."""
+def get_token_usage(tracker) -> dict:
+    """Extract token usage from a DSPy UsageTracker."""
     usage_data = {
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
         "calls": 0,
     }
-    
+
     try:
-        # LiteLLM logs usage in dspy.settings.litellm_usage_logs
-        if hasattr(dspy.settings, "litellm_usage_logs"):
-            logs = dspy.settings.litellm_usage_logs
-            if logs and isinstance(logs, list):
-                for log in logs:
-                    if isinstance(log, dict):
-                        usage_data["input_tokens"] += log.get("prompt_tokens", 0)
-                        usage_data["output_tokens"] += log.get("completion_tokens", 0)
-                        usage_data["calls"] += 1
-                usage_data["total_tokens"] = usage_data["input_tokens"] + usage_data["output_tokens"]
+        if tracker is None:
+            return usage_data
+
+        totals = tracker.get_total_tokens()
+        for lm, usage in totals.items():
+            if isinstance(usage, dict):
+                usage_data["input_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                usage_data["output_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                usage_data["input_tokens"] += int(usage.get("prompt_token", 0) or 0)
+                usage_data["output_tokens"] += int(usage.get("completion_token", 0) or 0)
+                usage_data["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+                usage_data["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+        usage_data["total_tokens"] = usage_data["input_tokens"] + usage_data["output_tokens"]
+        usage_data["calls"] = sum(len(entries) for entries in getattr(tracker, "usage_data", {}).values())
     except Exception:
         pass
-    
+
     return usage_data
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Helpers  (must be defined before any tab code runs)
+# Helpers  (must be defined before any tab code runs).
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_result_json(compiled, optimizer_name, sig_str, task_desc, params, metric_type):
@@ -1268,20 +1269,21 @@ with tab3:
                         prog.progress(15, text=f"[{run_idx+1}/{n_sel}] {opt_name} — compiling…")
                         opt_params = dict(params_per_optimizer[opt_name])
 
-                        # Reset token tracking before this optimizer run
-                        if hasattr(dspy.settings, "litellm_usage_logs"):
-                            dspy.settings.litellm_usage_logs = []
-
-                        with dspy.context(lm=lm):
-                            # valset is used by optimizers for candidate selection;
-                            # evalset is the separate held-out set used only for scoring.
-                            compiled = dispatch_optimizer(
-                                opt_name, opt_params,
-                                make_dspy_module(sig_str, task_d),
-                                trainset, valset, metric,
-                            )
-                            prog.progress(80, text=f"[{run_idx+1}/{n_sel}] {opt_name} — scoring on held-out eval…")
-                            eval_score = evaluate_compiled(compiled, evalset, metric)
+                        usage_tracker = UsageTracker()
+                        dspy.configure(usage_tracker=usage_tracker)
+                        try:
+                            with dspy.context(lm=lm):
+                                # valset is used by optimizers for candidate selection;
+                                # evalset is the separate held-out set used only for scoring.
+                                compiled = dispatch_optimizer(
+                                    opt_name, opt_params,
+                                    make_dspy_module(sig_str, task_d),
+                                    trainset, valset, metric,
+                                )
+                                prog.progress(80, text=f"[{run_idx+1}/{n_sel}] {opt_name} — scoring on held-out eval…")
+                                eval_score = evaluate_compiled(compiled, evalset, metric)
+                        finally:
+                            dspy.configure(usage_tracker=None)
 
                         # Collect diagnostics: demo count and whether instructions changed
                         n_demos    = 0
@@ -1302,24 +1304,22 @@ with tab3:
                         rj["meta"]["n_demos"]       = n_demos
                         rj["meta"]["instr_changed"] = instr_changed
                         rj["meta"]["baseline_score"] = base_score
-                        
+
                         # Capture token usage and calculate cost
-                        token_usage = get_token_usage()
+                        token_usage = get_token_usage(usage_tracker)
                         pricing = get_model_pricing(lm_model_id)
                         cost = calculate_cost(
                             token_usage["input_tokens"],
                             token_usage["output_tokens"],
                             pricing
                         )
-                        
+
                         # Store token usage and cost in both session state and result JSON
                         rj["meta"]["token_usage"] = token_usage
                         rj["meta"]["cost_usd"] = cost
-                        
+
                         st.session_state["optimization_runs"][-1]["token_usage"] = token_usage
                         st.session_state["optimization_runs"][-1]["cost_usd"] = cost
-                        
-                        # update the stored copy
                         st.session_state["optimization_runs"][-1]["result_json"] = rj
                         st.session_state["optimization_runs"][-1]["n_demos"]     = n_demos
                         st.session_state["optimization_runs"][-1]["instr_changed"] = instr_changed
