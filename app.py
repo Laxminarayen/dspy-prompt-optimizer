@@ -1049,6 +1049,24 @@ with tab4:
 
         baseline_score = st.session_state.get("baseline_score")
 
+                # Insight generator
+        def get_run_insight(run):
+            score = run["score"]
+
+            if score is None:
+                return "Run failed"
+
+            if score == 0:
+                return "No improvement. Check dataset or metric."
+
+            if run.get("n_demos", 0) == 0:
+                return "No demos selected."
+
+            if score >= 50:
+                return "Good result. Optimizer found useful examples."
+
+            return "Needs tuning."
+
         # Build comparison dataframe
         compare_rows = []
         for idx, r in enumerate(runs):
@@ -1067,6 +1085,7 @@ with tab4:
                 "Instr. changed":  ("Yes" if r.get("instr_changed") else "No"),
                 "Eval rows":       r["n_eval"],
                 "Metric":          r["metric"],
+                "Insight":         get_run_insight(r),
                 "Time (UTC)":      r["timestamp"],
             })
         df_compare = pd.DataFrame(compare_rows)
@@ -1080,6 +1099,17 @@ with tab4:
         best_score     = max(numeric_scores) if numeric_scores else None
         all_same       = len(set(numeric_scores)) == 1 and len(numeric_scores) > 1
 
+        if numeric_scores:
+            best_run = max(
+                [r for r in runs if r["score"] is not None],
+                key=lambda x: x["score"]
+            )
+
+            st.success(
+                f"🏆 Best Optimizer: {best_run['optimizer']} "
+                f"(Score: {best_run['score']})"
+            )
+        
         if all_same:
             st.warning(
                 "**All optimizers returned the same score.** Possible causes:\n"
